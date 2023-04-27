@@ -1,4 +1,4 @@
-"""Wisconsin Quench Kinetics Reactor."""
+"""yaqc-vocus"""
 
 
 from .__version__ import *
