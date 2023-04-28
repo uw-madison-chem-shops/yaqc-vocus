@@ -1,190 +1,93 @@
-"""GUI for displaying scans in progress, current slice etc."""
-
-from PySide2 import QtCore, QtWidgets
-import numpy as np
-
-import WrightTools as wt
-import yaqc_cmds
-import yaqc_cmds.project.project_globals as g
-import yaqc_cmds.sensors as sensors
-import yaqc_cmds.project.widgets as pw
-import yaqc_cmds.project.classes as pc
-import yaqc_cmds.somatic as somatic
+import pyqtgraph as pg
 
 
-class GUI(QtCore.QObject):
-    def __init__(self):
-        QtCore.QObject.__init__(self)
-        self.create_frame()
-        self.create_settings()
-        self.on_sensors_changed()
-        self.data = None
-
-    def create_frame(self):
-        self.main_widget = g.main_window.read().plot_widget
-        # create main daq tab
-        main_widget = self.main_widget
-        layout = QtWidgets.QHBoxLayout()
-        layout.setContentsMargins(0, 10, 0, 0)
-        main_widget.setLayout(layout)
-        # display
-        # container widget
-        display_container_widget = pw.ExpandingWidget()
-        display_container_widget.setLayout(QtWidgets.QVBoxLayout())
-        display_layout = display_container_widget.layout()
-        display_layout.setMargin(0)
-        layout.addWidget(display_container_widget)
-        # big number
-        big_number_container_widget = QtWidgets.QWidget()
-        big_number_container_widget.setLayout(QtWidgets.QHBoxLayout())
-        big_number_container_layout = big_number_container_widget.layout()
-        big_number_container_layout.setMargin(0)
-        self.big_display = pw.SpinboxAsDisplay(font_size=100)
-        self.big_channel = pw.Label("channel", font_size=72)
-        big_number_container_layout.addWidget(self.big_channel)
-        big_number_container_layout.addStretch(1)
-        big_number_container_layout.addWidget(self.big_display)
-        display_layout.addWidget(big_number_container_widget)
-        # plot
-        self.plot_widget = pw.Plot1D()
-        self.plot_scatter = self.plot_widget.add_scatter()
-        self.plot_line = self.plot_widget.add_line()
-        display_layout.addWidget(self.plot_widget)
-        # vertical line
-        line = pw.line("V")
-        layout.addWidget(line)
-        # settings
-        settings_container_widget = QtWidgets.QWidget()
-        settings_scroll_area = pw.scroll_area()
-        settings_scroll_area.setWidget(settings_container_widget)
-        settings_scroll_area.setMinimumWidth(300)
-        settings_scroll_area.setMaximumWidth(300)
-        settings_container_widget.setLayout(QtWidgets.QVBoxLayout())
-        self.settings_layout = settings_container_widget.layout()
-        self.settings_layout.setMargin(5)
-        layout.addWidget(settings_scroll_area)
-        g.shutdown.read().connect(self.on_shutdown)
-
-    def create_settings(self):
-        # display settings
-        input_table = pw.InputTable()
-        input_table.add("Display", None)
-        self.channel = pc.Combo()
-        input_table.add("Channel", self.channel)
-        self.axis = pc.Combo()
-        input_table.add("X-Axis", self.axis)
-        self.axis_units = pc.Combo()
-        input_table.add("X-Units", self.axis_units)
-        self.settings_layout.addWidget(input_table)
-        # global daq settings
-        input_table = pw.InputTable()
-        input_table.add("Settings", None)
-        # input_table.add("ms Wait", ms_wait)
-        for sensor in sensors.sensors:
-            input_table.add(sensor.name, None)
-            input_table.add("Status", sensor.busy)
-            input_table.add("Freerun", sensor.freerun)
-            input_table.add("Time", sensor.measure_time)
-        input_table.add("Scan", None)
-        # input_table.add("Loop Time", loop_time)
-        self.idx_string = pc.String(initial_value="None", display=True)
-        input_table.add("Scan Index", self.idx_string)
-        self.settings_layout.addWidget(input_table)
-        # stretch
-        self.settings_layout.addStretch(1)
-
-    def on_channels_changed(self):
-        new = list(sensors.get_channels_dict())
-        self.channel.set_allowed_values(new)
-
-    def on_data_file_created(self):
-        with somatic._wt5.data_container as data:
-            try:
-                allowed = [x.decode().split("{")[0].strip() for x in data.attrs["axes"]]
-            except AttributeError:
-                allowed = [x.split("{")[0].strip() for x in data.attrs["axes"]]
-            except:
-                allowed = [None]
-            if "wa" in allowed:
-                allowed.remove("wa")
-            self.axis.set_allowed_values(allowed)
-            self.on_axis_updated()
-
-    def on_axis_updated(self):
-        with somatic._wt5.data_container as data:
-            axis = data[self.axis.read()]
-            units = axis.attrs.get("units")
-            units = [units] + list(wt.units.get_valid_conversions(units))
-            self.axis_units.set_allowed_values(units)
-
-    def on_data_file_written(self):
-        with somatic._wt5.data_container as data:
-            last_idx_written = somatic._wt5.data_container.last_idx_written
-            self.idx_string.write(str(last_idx_written))
-            if data is None or last_idx_written is None:
-                return
-            # data
-            x_units = self.axis_units.read()
-            idx = last_idx_written
-            axis = data[self.axis.read()]
-            limits = list(
-                wt.units.convert(
-                    [np.nanmin(axis.full), np.nanmax(axis.full)], axis.attrs.get("units"), x_units
-                )
-            )
-            channel = data[self.channel.read()]
-            plot_idx = list(last_idx_written + (0,) * (channel.ndim - len(last_idx_written)))
-            plot_idx[self.axis.read_index()] = slice(None)
-
-            plot_idx = tuple(plot_idx)
-            try:
-                xi = wt.units.convert(
-                    axis[wt.kit.valid_index(plot_idx, axis.shape)],
-                    axis.attrs.get("units"),
-                    x_units,
-                )
-                yi = channel[wt.kit.valid_index(plot_idx, channel.shape)]
-                self.plot_scatter.setData(xi, yi)
-            except (TypeError, ValueError) as e:
-                print(e)
-                pass
-            # limits
-            try:
-                self.plot_widget.set_xlim(min(limits), max(limits))
-                self.plot_widget.set_ylim(np.min(channel), np.max(channel))
-            except Exception as e:
-                print(e)
-                pass
-
-    def on_sensors_changed(self):
-        for s in sensors.sensors:
-            s.update_ui.connect(self.update_big_number)
-        self.on_channels_changed()
-
-    def on_shutdown(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def update_big_number(self):
-        channel = self.channel.read()
-        if channel == "None":
-            return
-        sensor = sensors.get_channels_dict()[channel]
-        num = sensor.channels[channel]
-        if not np.isscalar(num):
-            channel = f"max({channel})"
-            num = np.max(num)
-        self.big_channel.setText(channel)
-        self.big_display.setValue(num)
+from qtpy import QtWidgets, QtCore
 
 
-gui = GUI()
-somatic.signals.data_file_written.connect(gui.on_data_file_written)
-somatic.signals.data_file_created.connect(gui.on_data_file_created)
-sensors.signals.channels_changed.connect(gui.on_channels_changed)
-sensors.signals.sensors_changed.connect(gui.on_sensors_changed)
-gui.axis.updated.connect(gui.on_axis_updated)
-gui.axis.updated.connect(gui.on_data_file_written)
-gui.axis_units.updated.connect(gui.on_data_file_written)
+class Plot1D(pg.GraphicsView):
+    def __init__(self, title=None, xAutoRange=True, yAutoRange=True):
+        pg.GraphicsView.__init__(self)
+        # create layout
+        self.graphics_layout = pg.GraphicsLayout(border="w")
+        self.setCentralItem(self.graphics_layout)
+        self.graphics_layout.layout.setSpacing(0)
+        self.graphics_layout.setContentsMargins(0.0, 0.0, 1.0, 1.0)
+        # create plot object
+        self.plot_object = self.graphics_layout.addPlot(0, 0)
+        self.labelStyle = {"color": "#FFF", "font-size": "14px"}
+        self.x_axis = self.plot_object.getAxis("bottom")
+        self.x_axis.setLabel(**self.labelStyle)
+        self.y_axis = self.plot_object.getAxis("left")
+        self.y_axis.setLabel(**self.labelStyle)
+        self.plot_object.showGrid(x=True, y=True, alpha=0.5)
+        self.plot_object.setMouseEnabled(False, True)
+        self.plot_object.enableAutoRange(x=xAutoRange, y=yAutoRange)
+        # title
+        if title:
+            self.plot_object.setTitle(title)
+
+    def add_scatter(self, color="c", size=10, symbol="o"):
+        curve = pg.ScatterPlotItem(symbol=symbol, pen=(color), brush=(color), size=size)
+        self.plot_object.addItem(curve)
+        return curve
+
+    def add_line(self, color="c", size=3, symbol="o"):
+        curve = pg.PlotCurveItem(symbol=symbol, pen=(color), brush=(color), size=size)
+        self.plot_object.addItem(curve)
+        return curve
+
+    def add_infinite_line(self, color="y", style="solid", angle=90.0, movable=False, hide=True):
+        """
+        Add an InfiniteLine object.
+
+        Parameters
+        ----------
+        color : (optional)
+            The color of the line. Accepts any argument valid for `pyqtgraph.mkColor <http://www.pyqtgraph.org/documentation/functions.html#pyqtgraph.mkColor>`_. Default is 'y', yellow.
+        style : {'solid', 'dashed', dotted'} (optional)
+            Linestyle. Default is solid.
+        angle : float (optional)
+            The angle of the line. 90 is vertical and 0 is horizontal. 90 is default.
+        movable : bool (optional)
+            Toggles if user can move the line. Default is False.
+        hide : bool (optional)
+            Toggles if the line is hidden upon initialization. Default is True.
+
+        Returns
+        -------
+        InfiniteLine object
+            Useful methods: setValue, show, hide
+        """
+        if style == "solid":
+            linestyle = QtCore.Qt.SolidLine
+        elif style == "dashed":
+            linestyle = QtCore.Qt.DashLine
+        elif style == "dotted":
+            linestyle = QtCore.Qt.DotLine
+        else:
+            linestyle = QtCore.Qt.SolidLine
+        pen = pg.mkPen(color, style=linestyle, width=1)
+        line = pg.InfiniteLine(pen=pen)
+        line.setAngle(angle)
+        line.setMovable(movable)
+        if hide:
+            line.hide()
+        self.plot_object.addItem(line)
+        return line
+
+    def set_labels(self, xlabel=None, ylabel=None):
+        if xlabel:
+            self.plot_object.setLabel("bottom", text=xlabel)
+            self.plot_object.showLabel("bottom")
+        if ylabel:
+            self.plot_object.setLabel("left", text=ylabel)
+            self.plot_object.showLabel("left")
+
+    def set_xlim(self, xmin, xmax):
+        self.plot_object.setXRange(xmin, xmax)
+
+    def set_ylim(self, ymin, ymax):
+        self.plot_object.setYRange(ymin, ymax)
+
+    def clear(self):
+        self.plot_object.clear()

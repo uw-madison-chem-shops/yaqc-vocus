@@ -6,150 +6,143 @@ import pathlib
 import time
 from dataclasses import dataclass
 import functools
+from collections import deque
 
-import matplotlib
+import numpy as np
 from qtpy import QtWidgets, QtCore
 import appdirs
 import toml
 import yaqc
 import qtypes
 import tidy_headers
-from yaqc_qtpy import QClient
+import yaqc_qtpy
+from yaqc_qtpy import property_items
 
 from .__version__ import __version__
-from ._procedure_runner import ProcedureRunner
 from ._data_writer import DataWriter
-from . import procedures
-from ._config import Config
-from ._valve import Valve
+from ._plot import Plot1D
 
-
-config = Config()
-
-matplotlib.use("ps")  # important - images will be generated in worker threads
 
 __here__ = pathlib.Path(os.path.abspath(__file__)).parent
 
 
 class MainWindow(QtWidgets.QMainWindow):
     shutdown = QtCore.Signal()
-    procedure_started = QtCore.Signal()  # emitted by procedure_runner
-    procedure_finished = QtCore.Signal()  # emitted by procedure_runner
 
     def __init__(self, config):
         super().__init__(parent=None)
         self.setWindowTitle("yaqc-wiqk")
-        self._connect_to_valves()
+        self._mfc_clients = [yaqc_qtpy.QClient(port=port, host="localhost") for port in (38001, 38002, 38003)]
         self._create_main_frame()
-        self._procedure_runner = ProcedureRunner(self)
         self._data_writer = DataWriter(self)
-        self._last_procedure_started = float("nan")
         self._poll_timer = QtCore.QTimer(interval=1000)  # one second
         self._poll_timer.timeout.connect(self._poll)
-        self.procedure_started.connect(self._on_procedure_started)
-        self.procedure_finished.connect(self._on_procedure_finished)
+        self._plot_timer = QtCore.QTimer(interval=1000)  # one second
+        self._plot_timer.timeout.connect(self._plot)
+        self._plot_timer.start()
+        # buffers
+        self._timestamp_buffers = [deque(maxlen=300) for _ in range(len(self._mfc_clients))]
+        self._position_buffers = [deque(maxlen=300) for _ in range(len(self._mfc_clients))]
+        for timestamp_buffer, position_buffer, client in zip(self._timestamp_buffers, self._position_buffers, self._mfc_clients):
 
-    def _connect_to_valves(self):
-        self._valves = {}
-        for i in range(4):
-            port = config[f"valve{i}_port"]
-            self._valves[i] = Valve(port=port, index=i)
+            def fill(result, *, timestamp_buffer, position_buffer):
+                timestamp_buffer.append(time.time())
+                position_buffer.append(result)
+
+            client.properties["position"].updated.connect(functools.partial(fill,
+                                                                            timestamp_buffer=timestamp_buffer,
+                                                                            position_buffer=position_buffer))
 
     def _create_main_frame(self):
         splitter = QtWidgets.QSplitter()
-        # tree ------------------------------------------------------------------------------------
-        self._tree_widget = qtypes.TreeWidget(width=500)
+
+        # tree
+        root = qtypes.Null()
+        root.append(qtypes.Null("MFC setpoints"))
+        for index, client in enumerate(self._mfc_clients):
+            header = qtypes.Null(f"mfc{index+1}")
+            destination = property_items.Float("destination",
+                                               client.properties["destination"],
+                                               client)
+            header.append(destination)
+            position = property_items.Float("position",
+                                            client.properties["position"],
+                                            client)
+            header.append(position)
+            root[0].append(header)
+        root.append(qtypes.Null("data recording"))
+        self._time_elapsed_widget = qtypes.String(label="time elapsed")
+        root[1].append(self._time_elapsed_widget)
+        self._filepath_widget = qtypes.String(label="filepath")
+        root[1].append(self._filepath_widget)
+        self._take_data_button = qtypes.Button("take data")
+        root[1].append(self._take_data_button)
+        self._take_data_button.set(value={"text": "go"})
+        self._take_data_button.updated_connect(self._on_take_data)
+        self._tree_widget = qtypes.TreeWidget(root)
         splitter.addWidget(self._tree_widget)
-        # valves
-        heading = qtypes.Null("valves")
-        self._tree_widget.append(heading)
-        for data in self._valves.values():
-            heading.append(data.enum)
-        # procedures
-        self._procedures_enum = qtypes.Enum(
-            "procedures", value={"allowed": ["continuous flow", "stopped flow", "flush", "refill"]}
-        )
-        self._tree_widget.append(self._procedures_enum)
-        self._procedures_enum.updated.connect(self._on_procedures_enum_updated)
-        # tabs ------------------------------------------------------------------------------------
-        self._tab_widget = QtWidgets.QTabWidget()
-        self._script_display_widget = QtWidgets.QTextEdit(readOnly=True)
-        self._tab_widget.addTab(self._script_display_widget, "script")
-        self._tab_widget.addTab(QtWidgets.QWidget(), "graph")
-        splitter.addWidget(self._tab_widget)
-        # finish ----------------------------------------------------------------------------------
+
+        # plot widgets
+        self._plot_widgets = [Plot1D() for _ in range(len(self._mfc_clients))]
+        self._scatters = [pw.add_scatter() for pw in self._plot_widgets]
+        self._lines = [pw.add_infinite_line(angle=0, hide=False) for pw in self._plot_widgets]
+        container = QtWidgets.QSplitter()
+        container.setOrientation(QtCore.Qt.Vertical)
+        for widget in self._plot_widgets:
+            container.addWidget(widget)
+        splitter.addWidget(container)
+
+        # update plot limits
+        for pw, client in zip(self._plot_widgets, self._mfc_clients):
+
+            def update_limits(result, *, pw):
+                pw.set_xlim(-3, 0)
+                pw.set_ylim(*result)
+
+            client.get_limits.finished.connect(functools.partial(update_limits, pw=pw))
+            client.get_limits()
+
+        # update destination indicator lines
+        for line, client in zip(self._lines, self._mfc_clients):
+
+            def update_destination(result, *, line):
+                line.setValue(result)
+
+            client.get_destination.finished.connect(functools.partial(update_destination, line=line))
+            # get_destination will be called by yaqc_qtpy internally
+            # because it is a property
+
+        # finish
         self.setCentralWidget(splitter)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
         self._tree_widget.expandAll()
-        self._on_procedures_enum_updated()
         self._tree_widget.resizeColumnToContents(0)
         self._tree_widget.resizeColumnToContents(1)
 
-    def _on_procedures_enum_updated(self):
-        new_procedure = self._procedures_enum.get_value()
-        self._kwargs = {}
-        self._procedures_enum.clear()
-        if new_procedure == "continuous flow":
-            self._kwargs["flow_rate"] = qtypes.Float("flow rate (mL/min)", value={"value": 10})
-        elif new_procedure == "stopped flow":
-            self._kwargs["flow_rate"] = qtypes.Float("flow rate (mL/min)", value={"value": 10})
-            self._kwargs["reaction_time"] = qtypes.Float("reaction time (s)", value={"value": 60})
-        elif new_procedure == "flush":
-            pass
-        elif new_procedure == "refill":
-            pass
+    def _on_take_data(self, data):
+        print("on take data", data)
+        self._take_data_button.updated_disconnect(self._on_take_data)
+        if data["text"] == "stop":
+            self._take_data_button.set(value={"text": "go"})
+            self._poll_timer.stop()
         else:
-            print(f"procedure {new_procedure} not recognized in _on_procedures_enum_updated")
-            return
-        for obj in self._kwargs.values():
-            self._procedures_enum.append(obj)
-        self._run_button = qtypes.Button("run")
-        self._run_button.updated.connect(self._on_run_button_updated)
-        self._procedures_enum.append(self._run_button)
-        self._time_elapsed_widget = qtypes.String("time elapsed (min:sec)", disabled=True)
-        self._procedures_enum.append(self._time_elapsed_widget)
-        self._data_filepath_widget = qtypes.String("data filepath", disabled=True)
-        self._procedures_enum.append(self._data_filepath_widget)
-        # update script display
-        path = __here__ / "procedures" / f"{new_procedure.replace(' ', '_')}.py"
-        with open(path, "r") as f:
-            self._script_display_widget.setText(f.read())
+            self._take_data_button.set(value={"text": "stop"})
+            self._poll_timer.start()
+            self._last_procedure_started = time.time()
+            self._data_writer.create_file(start_time=self._last_procedure_started)
+            self._filepath_widget.set({"value": str(self._data_writer.filepath)})
+        self._take_data_button.updated_connect(self)._on_take_data()
 
-    def _on_procedure_finished(self):
-        print("_on_procedure_finished")
-        self._poll_timer.stop()
-        self._procedures_enum.disabled.emit(False)
-        self._run_button.disabled.emit(False)
-        for obj in self._kwargs.values():
-            obj.disabled.emit(False)
-
-    def _on_procedure_started(self):
-        print("_on_procedure_started")
-        self._procedures_enum.disabled.emit(True)
-        self._run_button.disabled.emit(True)
-        for obj in self._kwargs.values():
-            obj.disabled.emit(True)
-
-    def _on_run_button_updated(self):
-        procedure = self._procedures_enum.get_value()
-        self._last_procedure_started = time.time()
-        # make data file
-        self._data_writer.create_file(procedure=procedure,
-                                      procedure_args=self._kwargs,
-                                      start_time = self._last_procedure_started)
-        self._data_filepath_widget.set_value(str(self._data_writer.filepath))
-        # start data recording
-        self._poll_timer.start()
-        # launch procedure
-        function = procedures.__dict__[procedure.lower().replace(" ", "_")]
-        kwargs = {k: v.get_value() for k, v in self._kwargs.items()}
-        self._procedure_runner.run(function, kwargs=kwargs)
+    def _plot(self):
+        # scatter data
+        for timestamp_buffer, position_buffer, scatter in zip(self._timestamp_buffers, self._position_buffers, self._scatters):
+            scatter.setData((np.array(timestamp_buffer) - time.time())/60, position_buffer)
 
     def _poll(self):
+        print("poll")
         minutes, seconds = divmod(time.time() - self._last_procedure_started, 60)
         minutes = str(round(minutes)).zfill(2)
         seconds = str(round(seconds)).zfill(2)
         self._time_elapsed_widget.set_value(f"{minutes}:{seconds}")
-        print("poll")
         self._data_writer.write()

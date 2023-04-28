@@ -20,6 +20,8 @@ requires = ["appdirs",
 	    "qtpy",
 	    "toml",
 	    "yaqc",
+            "tidy_headers",
+            "yaqc-qtpy",
 	    ]
 
 [tool.flit.scripts]
