@@ -132,7 +132,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._last_procedure_started = time.time()
             self._data_writer.create_file(start_time=self._last_procedure_started)
             self._filepath_widget.set({"value": str(self._data_writer.filepath)})
-        self._take_data_button.updated_connect(self)._on_take_data()
+        self._take_data_button.updated_connect(self._on_take_data)
 
     def _plot(self):
         # scatter data
